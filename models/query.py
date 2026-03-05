@@ -29,3 +29,5 @@ class NextQueryResponse(BaseModel):
     similar_prior_queries: Optional[List[Dict]] = None
     attempts: Optional[int] = None
     coverage_suggestion: Optional[str] = None
+    relevance_score: Optional[float] = None
+    target_dimensions: Optional[List[str]] = None

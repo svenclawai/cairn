@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     exa_api_key: str = ""
     similarity_threshold: float = 0.92
     max_dedup_attempts: int = 3
+    max_relevance_retries: int = 2
     coverage_cache_minutes: int = 5
 
     class Config:

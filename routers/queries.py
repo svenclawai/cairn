@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -10,6 +11,8 @@ from models.query import NextQueryResponse, QueryCreate, QueryListResponse, Quer
 from services.dedup import is_semantically_duplicate
 from services.embeddings import embed
 from services.query_generator import generate_query
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions/{session_id}", tags=["queries"])
 
@@ -24,10 +27,27 @@ def _load_session(session_id: str, api_key: str) -> dict:
     return result.data[0]
 
 
+def _fetch_latest_coverage(session_id: str) -> Optional[dict]:
+    """Fetch the most recent coverage scores for a session from the DB."""
+    sb = get_supabase()
+    result = (
+        sb.table("coverage_scores")
+        .select("scores")
+        .eq("session_id", session_id)
+        .order("computed_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if result.data:
+        return result.data[0]["scores"]
+    return None
+
+
 @router.get("/next-query", response_model=NextQueryResponse)
 async def next_query(
     session_id: str,
     hint: Optional[str] = Query(None),
+    enforce_dimensions: bool = Query(False),
     x_api_key: str = Header(...),
 ):
     session = _load_session(session_id, x_api_key)
@@ -42,14 +62,21 @@ async def next_query(
     )
     prior_queries = [r["phrase"] for r in (prior_result.data or [])]
 
-    rejected_candidates: list[dict] = []
+    # Fetch latest coverage to feed into query generation
+    coverage_scores = _fetch_latest_coverage(session_id)
 
-    for attempt in range(1, settings.max_dedup_attempts + 1):
+    rejected_candidates = []  # type: list[dict]
+
+    max_attempts = settings.max_dedup_attempts + settings.max_relevance_retries
+
+    for attempt in range(1, max_attempts + 1):
         result = await generate_query(
             goal_prompt=session["goal_prompt"],
             goal_schema=session["goal_schema"],
             prior_queries=prior_queries,
             rejected_candidates=rejected_candidates if rejected_candidates else None,
+            coverage_scores=coverage_scores,
+            enforce_dimensions=enforce_dimensions,
         )
 
         phrase = result.get("phrase")
@@ -60,6 +87,20 @@ async def next_query(
                 coverage_suggestion="Consider calling /coverage to assess completeness.",
             )
 
+        # Check relevance score — reject if too low
+        relevance_score = result.get("relevance_score")
+        if relevance_score is not None and relevance_score < 0.7:
+            logger.info(
+                "Rejecting query '%s' for low relevance %.2f (attempt %d)",
+                phrase, relevance_score, attempt,
+            )
+            rejected_candidates.append({
+                "phrase": phrase,
+                "similar_to": f"off-topic (relevance={relevance_score:.2f})",
+            })
+            continue
+
+        # Check semantic dedup
         is_dup, similar, _ = await is_semantically_duplicate(
             session_id, phrase, settings.similarity_threshold
         )
@@ -70,6 +111,8 @@ async def next_query(
                 reasoning=result.get("reasoning", ""),
                 similar_prior_queries=similar if similar else [],
                 attempts=attempt,
+                relevance_score=relevance_score,
+                target_dimensions=result.get("target_dimensions"),
             )
 
         rejected_candidates.append(
@@ -78,7 +121,7 @@ async def next_query(
 
     return NextQueryResponse(
         phrase=None,
-        reasoning=f"Could not generate a non-redundant query after {settings.max_dedup_attempts} attempts.",
+        reasoning=f"Could not generate a suitable query after {max_attempts} attempts.",
         coverage_suggestion="Consider calling /coverage to assess completeness.",
     )
 
